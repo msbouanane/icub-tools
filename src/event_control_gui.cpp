@@ -3,6 +3,7 @@
 #include <event-driven/algs.h>
 #include <event-driven/vis/filters.h>
 #include <event_flicker/filter.hpp>
+#include <event_flicker/pink.hpp>
 #include <yarp/os/Network.h>
 #include <yarp/os/RpcClient.h>
 #include <yarp/os/Bottle.h>
@@ -71,6 +72,7 @@ struct Camera {
     std::atomic<int> kernel{7}, decayMilli{300}, mode{0}, windowMs{30};
     std::atomic<bool> denoise{false};
     std::atomic<bool> removeFlicker{false};
+    std::atomic<int> flickerMode{1};
     std::atomic<int> flickerHz{50};
     std::atomic<int> flickerBins{100};
     std::mutex mutex;
@@ -89,7 +91,9 @@ struct Camera {
     // Filter and sensor clock are worker-owned, never touched by the UI thread.
     std::unique_ptr<event_flicker::Filter> flicker;
     std::unique_ptr<event_flicker::TickClock> flickerClock;
+    std::unique_ptr<event_flicker::PinkFilter> pinkFlicker;
     bool currentFlicker{false};
+    int currentFlickerMode{1};
     int currentFlickerHz{50};
     int currentFlickerBins{100};
     bool flickerFault{false};
@@ -100,14 +104,18 @@ struct Camera {
 
     void configureFlicker() {
         const bool enabled = removeFlicker.load();
+        const int mode = ev::ts_status ? flickerMode.load() : 1;
         const int hz = flickerHz.load();
         const int bins = flickerBins.load();
-        if (enabled == currentFlicker && hz == currentFlickerHz && bins == currentFlickerBins) return;
+        if (enabled == currentFlicker && mode == currentFlickerMode &&
+            hz == currentFlickerHz && bins == currentFlickerBins) return;
         currentFlicker = enabled;
+        currentFlickerMode = mode;
         currentFlickerHz = hz;
         currentFlickerBins = bins;
         flicker.reset();
         flickerClock.reset();
+        pinkFlicker.reset();
         flickerFault = false;
         lastFlickerPacket = {};
         lastClockAdvance = {};
@@ -116,17 +124,29 @@ struct Camera {
         QString status = "off";
         if (enabled) {
             try {
-                if (!ev::ts_status)
-                    throw std::runtime_error("sensor timestamps required");
-                event_flicker::Config config;
-                config.width = width;
-                config.height = height;
-                config.frequency_hz = hz;
-                config.bins_per_period = bins;
-                flicker = std::make_unique<event_flicker::Filter>(config);
-                flickerClock = std::make_unique<event_flicker::TickClock>(
-                    std::uint64_t(ev::max_stamp) + 1, ev::tsscaler * 1e9);
-                status = "warming up";
+                if (mode == 0) {
+                    if (!ev::ts_status)
+                        throw std::runtime_error("sensor timestamps required for EFR");
+                    event_flicker::Config config;
+                    config.width = width;
+                    config.height = height;
+                    config.frequency_hz = hz;
+                    config.bins_per_period = bins;
+                    flicker = std::make_unique<event_flicker::Filter>(config);
+                    flickerClock = std::make_unique<event_flicker::TickClock>(
+                        std::uint64_t(ev::max_stamp) + 1, ev::tsscaler * 1e9);
+                    status = "EFR warming up";
+                } else {
+                    event_flicker::PinkConfig config;
+                    config.width = width;
+                    config.height = height;
+                    config.packet_size = 64;
+                    config.window_events = 512;
+                    config.flicker_ratio = 0.5;
+                    config.min_overlap = 2;
+                    pinkFlicker = std::make_unique<event_flicker::PinkFilter>(config);
+                    status = "PINK warming up";
+                }
             } catch (const std::exception& e) {
                 flickerFault = true;
                 status = QString("unavailable: ") + e.what();
@@ -160,53 +180,64 @@ struct Camera {
         QString status;
         const auto started = Clock::now();
         try {
-            const double envelope = packet.envelope().getTime();
-            const double halfWrapSeconds = (std::uint64_t(ev::max_stamp) + 1) * ev::tsscaler / 2;
-            const double gapLimit = std::min(0.5, halfWrapSeconds);
-            const bool gap = lastFlickerPacket != Clock::time_point{} &&
-                std::chrono::duration<double>(now - lastFlickerPacket).count() >= gapLimit;
-            const bool sourceJump = lastSourceEnvelope > 0 && envelope > 0 &&
-                (envelope < lastSourceEnvelope || envelope - lastSourceEnvelope >= gapLimit);
-            if (gap || sourceJump) {
-                flicker->reset();
-                flickerClock->reset();
-                lastClockAdvance = {};
-                lastFlickerTime = 0;
-                std::lock_guard<std::mutex> lock(mutex);
-                history.clear(); historyCount = 0;
-            }
-            bool advancedClock = false;
-            std::int64_t firstTime = -1;
-            std::size_t checked = 0;
-            for (const auto& e : packet) {
-                if ((checked++ % 256) == 0 && (!running.load() || !removeFlicker.load() ||
-                    flickerHz.load() != currentFlickerHz || flickerBins.load() != currentFlickerBins)) {
-                    display.events.clear();
-                    return; // The next worker iteration applies the new setting.
+            if (currentFlickerMode == 1) {
+                if (!pinkFlicker) throw std::runtime_error("PINK filter not configured");
+                for (const auto& e : packet) {
+                    if (e.x >= width || e.y >= height) continue;
+                    pinkFlicker->push({0, e.x, e.y, e.p ? 1 : -1}, onEvent);
                 }
-                const auto t = flickerClock->unwrap(e.ts);
-                if (firstTime < 0) firstTime = t;
-                advancedClock = advancedClock || t > lastFlickerTime;
-                lastFlickerTime = t;
-                if (e.x >= width || e.y >= height) continue;
-                flicker->push({t, e.x, e.y, e.p ? 1 : -1}, onEvent);
+                pinkFlicker->flush(onEvent);
+                status = QString("PINK fallback, %1 out").arg(static_cast<qulonglong>(emitted));
+            } else {
+                if (!flicker || !flickerClock) throw std::runtime_error("EFR filter not configured");
+                const double envelope = packet.envelope().getTime();
+                const double halfWrapSeconds = (std::uint64_t(ev::max_stamp) + 1) * ev::tsscaler / 2;
+                const double gapLimit = std::min(0.5, halfWrapSeconds);
+                const bool gap = lastFlickerPacket != Clock::time_point{} &&
+                    std::chrono::duration<double>(now - lastFlickerPacket).count() >= gapLimit;
+                const bool sourceJump = lastSourceEnvelope > 0 && envelope > 0 &&
+                    (envelope < lastSourceEnvelope || envelope - lastSourceEnvelope >= gapLimit);
+                if (gap || sourceJump) {
+                    flicker->reset();
+                    flickerClock->reset();
+                    lastClockAdvance = {};
+                    lastFlickerTime = 0;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    history.clear(); historyCount = 0;
+                }
+                bool advancedClock = false;
+                std::int64_t firstTime = -1;
+                std::size_t checked = 0;
+                for (const auto& e : packet) {
+                    if ((checked++ % 256) == 0 && (!running.load() || !removeFlicker.load() ||
+                        flickerHz.load() != currentFlickerHz || flickerBins.load() != currentFlickerBins)) {
+                        display.events.clear();
+                        return; // The next worker iteration applies the new setting.
+                    }
+                    const auto t = flickerClock->unwrap(e.ts);
+                    if (firstTime < 0) firstTime = t;
+                    advancedClock = advancedClock || t > lastFlickerTime;
+                    lastFlickerTime = t;
+                    if (e.x >= width || e.y >= height) continue;
+                    flicker->push({t, e.x, e.y, e.p ? 1 : -1}, onEvent);
+                }
+                // The newest SENSOR timestamp is a watermark; host arrival time is
+                // not. A final partial bin waits for the next packet (or watermark).
+                if (firstTime >= 0) flicker->advance_to(lastFlickerTime, onEvent);
+                if (advancedClock || lastClockAdvance == Clock::time_point{}) lastClockAdvance = now;
+                if (now - lastClockAdvance >= std::chrono::milliseconds(100))
+                    throw std::runtime_error("sensor timestamps are not advancing");
+                lastFlickerPacket = now;
+                lastSourceEnvelope = envelope;
+                const double ms = std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+                status = QString("%1, %2 Hz, %3 ms/packet, %4 out")
+                    .arg(lastFlickerTime < 100000000 ? "warming up" : "on")
+                    .arg(currentFlickerHz).arg(ms, 0, 'f', 2)
+                    .arg(static_cast<qulonglong>(emitted));
+                const double sourceSpanMs = (lastFlickerTime - firstTime) / 1e6;
+                if (sourceSpanMs > 0 && ms > sourceSpanMs)
+                    status += " (slower than this packet's sensor span)";
             }
-            // The newest SENSOR timestamp is a watermark; host arrival time is
-            // not. A final partial bin waits for the next packet (or watermark).
-            if (firstTime >= 0) flicker->advance_to(lastFlickerTime, onEvent);
-            if (advancedClock || lastClockAdvance == Clock::time_point{}) lastClockAdvance = now;
-            if (now - lastClockAdvance >= std::chrono::milliseconds(100))
-                throw std::runtime_error("sensor timestamps are not advancing");
-            lastFlickerPacket = now;
-            lastSourceEnvelope = envelope;
-            const double ms = std::chrono::duration<double,std::milli>(Clock::now()-started).count();
-            status = QString("%1, %2 Hz, %3 ms/packet, %4 out")
-                .arg(lastFlickerTime < 100000000 ? "warming up" : "on")
-                .arg(currentFlickerHz).arg(ms, 0, 'f', 2)
-                .arg(static_cast<qulonglong>(emitted));
-            const double sourceSpanMs = (lastFlickerTime - firstTime) / 1e6;
-            if (sourceSpanMs > 0 && ms > sourceSpanMs)
-                status += " (slower than this packet's sensor span)";
         } catch (const std::exception& e) {
             flickerFault = true;
             display.events.clear();
@@ -414,6 +445,7 @@ class Window : public QMainWindow {
     QComboBox *rawModes[2]{}, *representations[2]{};
     QCheckBox *noise[2]{}, *linkHardware{}, *linkEros{};
     QCheckBox* removeFlicker{};
+    QComboBox* flickerModeSelector{};
     QSpinBox* flickerFrequency{};
     QComboBox* flickerResolution{};
     QLabel* flickerInfo{};
@@ -462,11 +494,20 @@ public:
         linkEros->setChecked(true);
         processing->addRow(linkEros);
         removeFlicker = new QCheckBox("Remove light flicker (both event views)");
-        removeFlicker->setToolTip("EFR comb filter on the top row. Bottom-row representations use their existing input.");
-        removeFlicker->setEnabled(ev::ts_status);
-        if (!ev::ts_status)
-            removeFlicker->setToolTip("Unavailable: event-driven was built without individual sensor timestamps.");
+        removeFlicker->setToolTip("Choose the flicker filter mode below. EFR needs sensor timestamps; PINK works without them.");
+        removeFlicker->setEnabled(true);
         processing->addRow(removeFlicker);
+        flickerModeSelector = new QComboBox;
+        flickerModeSelector->addItems({"EFR comb filter", "PINK fallback"});
+        flickerModeSelector->setCurrentIndex(1);
+        if (!ev::ts_status) {
+            flickerModeSelector->setCurrentIndex(1);
+            flickerModeSelector->setEnabled(false);
+            flickerModeSelector->setToolTip("PINK fallback is active because this build has no sensor timestamps.");
+        } else {
+            flickerModeSelector->setToolTip("Use the original EFR comb filter or the timestamp-free PINK heuristic fallback.");
+        }
+        processing->addRow("Flicker mode", flickerModeSelector);
         flickerFrequency = new QSpinBox;
         flickerFrequency->setRange(10, 1000);
         flickerFrequency->setValue(50);
@@ -481,6 +522,13 @@ public:
         processing->addRow(flickerInfo);
         connect(removeFlicker, &QCheckBox::toggled, this, [this](bool enabled) {
             for (auto& c : cameras) c.removeFlicker = enabled;
+        });
+        connect(flickerModeSelector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+            if (!ev::ts_status && index == 0) {
+                flickerModeSelector->setCurrentIndex(1);
+                return;
+            }
+            for (auto& c : cameras) c.flickerMode = index;
         });
         connect(flickerFrequency, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int hz) {
             for (auto& c : cameras) c.flickerHz = hz;

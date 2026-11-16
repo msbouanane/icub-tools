@@ -19,6 +19,12 @@ not a verbatim port or a bit-for-bit reproduction of the EFR executable. The
 authors' offline queue implementation and its recording I/O are not embedded.
 E2VID and the upstream dataset/sorting tools are not required.
 
+For bandwidth-constrained, no-timestamp deployments, this directory also contains a
+separate heuristic fallback: `event_flicker::PinkFilter`. It is a different,
+timestamp-free polarity-overlap filter inspired by PINK-style flicker detection.
+It is intentionally not equivalent to the EFR comb filter and is best treated as a
+lightweight fallback when sensor timestamps cannot be transmitted.
+
 The output contains regenerated signed events. It is **not a subset** of the
 input: output timestamps/polarities can differ and the event count can increase.
 Do not interpret output/input as a percentage of original events retained.
