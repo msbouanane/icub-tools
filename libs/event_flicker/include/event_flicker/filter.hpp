@@ -40,7 +40,7 @@ struct Stats {
 
 // Causal, time-binned implementation of Wang et al., ICRA 2022, Eq. (7).
 // This is not a bit-for-bit port of the authors' offline queue implementation.
-// Single-thread owned. The synchronous emit callback must not throw or re-enter.
+// Single-thread owned. The synchronous output callback must not throw or re-enter.
 class Filter {
 public:
     using Emit = std::function<void(const Event&)>;
@@ -51,11 +51,11 @@ public:
 
     // Emits completed bins BEFORE ingesting this event. Equal input timestamps
     // are allowed. Output is regenerated (+/-1), not a subset of input events.
-    void push(const Event& event, const Emit& emit);
+    void push(const Event& event, const Emit& onEvent);
     // Declare that no future input precedes watermark_ns. Emits bins ending at
     // or before it, including delayed responses at pixels with no new input.
     // Never advance using host arrival time unless mapped to the sensor clock.
-    void advance_to(std::int64_t watermark_ns, const Emit& emit);
+    void advance_to(std::int64_t watermark_ns, const Emit& onEvent);
     void reset();
     // Optional independently calibrated mean polarity in [-1,1]. Applied to
     // future input only; defaults to zero. Not estimated from moving scenes.

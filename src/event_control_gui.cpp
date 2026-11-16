@@ -144,7 +144,7 @@ struct Camera {
     void filterDisplay(ev::packet<ev::AE>& packet, DisplayPacket& display,
                        Clock::time_point now, std::size_t stride) {
         std::size_t emitted = 0;
-        event_flicker::Filter::Emit emit = [&](const event_flicker::Event& e) {
+        event_flicker::Filter::Emit onEvent = [&](const event_flicker::Event& e) {
             if (emitted++ % stride == 0 && display.events.size() < 250000)
                 display.events.push_back({static_cast<uint16_t>(e.x),
                     static_cast<uint16_t>(e.y), e.polarity > 0});
@@ -152,7 +152,7 @@ struct Camera {
         if (!currentFlicker) {
             for (const auto& e : packet) {
                 if (e.x >= width || e.y >= height) continue;
-                emit({0, e.x, e.y, e.p ? 1 : -1});
+                onEvent({0, e.x, e.y, e.p ? 1 : -1});
             }
             return;
         }
@@ -189,11 +189,11 @@ struct Camera {
                 advancedClock = advancedClock || t > lastFlickerTime;
                 lastFlickerTime = t;
                 if (e.x >= width || e.y >= height) continue;
-                flicker->push({t, e.x, e.y, e.p ? 1 : -1}, emit);
+                flicker->push({t, e.x, e.y, e.p ? 1 : -1}, onEvent);
             }
             // The newest SENSOR timestamp is a watermark; host arrival time is
             // not. A final partial bin waits for the next packet (or watermark).
-            if (firstTime >= 0) flicker->advance_to(lastFlickerTime, emit);
+            if (firstTime >= 0) flicker->advance_to(lastFlickerTime, onEvent);
             if (advancedClock || lastClockAdvance == Clock::time_point{}) lastClockAdvance = now;
             if (now - lastClockAdvance >= std::chrono::milliseconds(100))
                 throw std::runtime_error("sensor timestamps are not advancing");

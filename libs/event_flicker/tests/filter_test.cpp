@@ -30,12 +30,12 @@ void reference_equation(unsigned bins) {
     std::mt19937 rng(1234);
     for (int n = 0; n < 500; ++n) x[n] = static_cast<int>(rng() % 7) - 3;
     std::vector<Event> actual, expected;
-    auto emit = [&](const Event& e) { actual.push_back(e); };
+    auto onEvent = [&](const Event& e) { actual.push_back(e); };
     for (int n = 0; n < count; ++n) {
         for (int j = 0; j < std::abs(x[n]); ++j)
-            filter.push({n * filter.bin_width_ns(), 1, 1, x[n] > 0 ? 1 : -1}, emit);
+            filter.push({n * filter.bin_width_ns(), 1, 1, x[n] > 0 ? 1 : -1}, onEvent);
     }
-    filter.advance_to(count * filter.bin_width_ns(), emit);
+    filter.advance_to(count * filter.bin_width_ns(), onEvent);
     auto at = [](const std::vector<double>& v, int n) { return n < 0 ? 0.0 : v[n]; };
     double residual = 0;
     const double rho2 = 1 - (1 - c.rho) / 10;
@@ -58,15 +58,15 @@ void reference_equation(unsigned bins) {
 void flicker_and_motion() {
     Filter filter(small());
     std::vector<Event> out;
-    auto emit = [&](const Event& e) { out.push_back(e); };
+    auto onEvent = [&](const Event& e) { out.push_back(e); };
     // 100Hz illumination on pixel 0; isolated moving edge crossings on pixel 1.
     for (int ms = 0; ms < 1000; ++ms) {
         if (ms % 5 == 0)
-            filter.push({ms * 1000000LL, 0, 0, ms % 10 == 0 ? 1 : -1}, emit);
+            filter.push({ms * 1000000LL, 0, 0, ms % 10 == 0 ? 1 : -1}, onEvent);
         if (ms == 257 || ms == 613 || ms == 887)
-            filter.push({ms * 1000000LL, 1, 0, 1}, emit);
+            filter.push({ms * 1000000LL, 1, 0, 1}, onEvent);
     }
-    filter.advance_to(1100000000LL, emit);
+    filter.advance_to(1100000000LL, onEvent);
     auto remaining = std::count_if(out.begin(), out.end(), [](const Event& e) {
         return e.x == 0 && e.timestamp_ns >= 200000000 && e.timestamp_ns < 1000000000;
     });
@@ -85,30 +85,30 @@ void flicker_and_motion() {
 void latency_and_lifecycle() {
     Filter f(small());
     std::vector<Event> out;
-    auto emit = [&](const Event& e) { out.push_back(e); };
-    f.push({12345, 0, 0, 1}, emit);
-    f.advance_to(f.bin_width_ns()-1, emit);
+    auto onEvent = [&](const Event& e) { out.push_back(e); };
+    f.push({12345, 0, 0, 1}, onEvent);
+    f.advance_to(f.bin_width_ns()-1, onEvent);
     require(out.empty(), "Incomplete bin emitted");
-    f.advance_to(f.bin_width_ns(), emit);
+    f.advance_to(f.bin_width_ns(), onEvent);
     require(out.size() == 1 && out[0].timestamp_ns == f.bin_width_ns(), "First event latency");
     // Advances quiet pixels too; fully drain finite truncated tails, then skip a huge gap.
-    f.advance_to(2000000000LL, emit);
+    f.advance_to(2000000000LL, onEvent);
     require(f.stats().pending_bins == 0 && f.stats().active_pixels == 0, "Tail did not drain");
-    f.advance_to(1000000000000000LL, emit);
-    rejects([&] { f.push({1,0,0,1},emit); });
+    f.advance_to(1000000000000000LL, onEvent);
+    rejects([&] { f.push({1,0,0,1},onEvent); });
     f.reset(); out.clear();
-    f.advance_to(1000000, emit);
+    f.advance_to(1000000, onEvent);
     require(out.empty() && f.stats().input_events == 0, "Reset leaked output");
-    rejects([&] { f.push({1000000,4,0,1},emit); });
-    rejects([&] { f.push({1000000,0,0,0},emit); });
+    rejects([&] { f.push({1000000,4,0,1},onEvent); });
+    rejects([&] { f.push({1000000,0,0,0},onEvent); });
     rejects([&] { f.set_bias(0,0,std::numeric_limits<double>::quiet_NaN()); });
-    f.set_bias(0,0,1); f.push({1000000,0,0,1},emit); f.advance_to(2000000,emit);
+    f.set_bias(0,0,1); f.push({1000000,0,0,1},onEvent); f.advance_to(2000000,onEvent);
     require(out.empty(), "Calibrated bias not applied");
     auto c = small(); c.max_pending_bins = 1;
     Filter bounded(c);
-    rejects([&] { bounded.push({0,0,0,1},emit); });
-    rejects([&] { bounded.advance_to(100000,emit); });
-    bounded.reset(); bounded.set_bias(0,0,1); bounded.push({0,0,0,1},emit);
+    rejects([&] { bounded.push({0,0,0,1},onEvent); });
+    rejects([&] { bounded.advance_to(100000,onEvent); });
+    bounded.reset(); bounded.set_bias(0,0,1); bounded.push({0,0,0,1},onEvent);
     c = small(); c.frequency_hz = std::numeric_limits<double>::infinity();
     rejects([&] { Filter invalid(c); });
     c = small(); c.bins_per_period = 11;

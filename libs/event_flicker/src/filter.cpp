@@ -77,7 +77,7 @@ struct Filter::Impl {
         cell.values[slot] += value;
     }
 
-    void advance(std::int64_t time, const Emit& emit) {
+    void advance(std::int64_t time, const Emit& onEvent) {
         const auto target = time / step;
         if (!started) { cursor = target; started = true; }
         while (cursor < target && stats.pending_bins) {
@@ -99,7 +99,7 @@ struct Filter::Impl {
                     while (std::abs(residual[pixel]) >= cfg.threshold) {
                         const int sign = residual[pixel] > 0 ? 1 : -1;
                         residual[pixel] -= sign * cfg.threshold;
-                        emit({(cursor + 1) * step, pixel % cfg.width, pixel / cfg.width, sign});
+                        onEvent({(cursor + 1) * step, pixel % cfg.width, pixel / cfg.width, sign});
                         ++stats.output_events;
                     }
                 }
@@ -119,15 +119,15 @@ struct Filter::Impl {
 Filter::Filter(Config config) : impl_(std::make_unique<Impl>(config)) {}
 Filter::~Filter() = default;
 
-void Filter::push(const Event& e, const Emit& emit) {
+void Filter::push(const Event& e, const Emit& onEvent) {
     auto& p = *impl_;
     p.check_time(e.timestamp_ns);
     const auto pixel = p.index(e.x, e.y);
     if (e.polarity != 1 && e.polarity != -1)
         throw std::invalid_argument("Event polarity must be +1 or -1");
-    if (!emit) throw std::invalid_argument("Output callback is required");
+    if (!onEvent) throw std::invalid_argument("Output callback is required");
     try {
-        p.advance(e.timestamp_ns, emit);
+        p.advance(e.timestamp_ns, onEvent);
         const auto tick = e.timestamp_ns / p.step;
         const double amplitude = e.polarity - p.bias[pixel];
         const double gain = (1.0 - p.cfg.rho) / 10.0;
@@ -139,10 +139,10 @@ void Filter::push(const Event& e, const Emit& emit) {
     } catch (...) { p.faulted = true; throw; }
 }
 
-void Filter::advance_to(std::int64_t time, const Emit& emit) {
+void Filter::advance_to(std::int64_t time, const Emit& onEvent) {
     impl_->check_time(time);
-    if (!emit) throw std::invalid_argument("Output callback is required");
-    try { impl_->advance(time, emit); }
+    if (!onEvent) throw std::invalid_argument("Output callback is required");
+    try { impl_->advance(time, onEvent); }
     catch (...) { impl_->faulted = true; throw; }
 }
 

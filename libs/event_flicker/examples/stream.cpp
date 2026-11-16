@@ -10,7 +10,7 @@
 // This text demo is not intended as a high-rate transport.
 int main() {
     event_flicker::Filter filter;
-    auto emit = [](const event_flicker::Event& e) {
+    auto onEvent = [](const event_flicker::Event& e) {
         std::cout << e.timestamp_ns << ' ' << e.x << ' ' << e.y << ' ' << e.polarity << '\n';
     };
     try {
@@ -20,12 +20,12 @@ int main() {
             if (line.rfind("watermark ",0) == 0) {
                 std::string tag; std::int64_t t;
                 if (!(row >> tag >> t)) throw std::runtime_error("Invalid watermark");
-                filter.advance_to(t,emit);
+                filter.advance_to(t,onEvent);
             } else {
                 event_flicker::Event e;
                 if (!(row >> e.timestamp_ns >> e.x >> e.y >> e.polarity))
                     throw std::runtime_error("Expected timestamp_ns x y polarity");
-                filter.push(e,emit);
+                filter.push(e,onEvent);
             }
             std::cout.flush();
         }
