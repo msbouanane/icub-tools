@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_subdirectory(libs/event_flicker)
+
 find_package(YARP REQUIRED COMPONENTS os sig dev math)
 find_package(event-driven REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs)
@@ -78,6 +80,7 @@ find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
 add_executable(event_control_gui src/event_control_gui.cpp)
 target_link_libraries(event_control_gui PRIVATE
+    event_flicker::event_flicker
     Qt${QT_VERSION_MAJOR}::Widgets
     YARP::YARP_os YARP::YARP_init
     ev::event-driven ${OpenCV_LIBS} Threads::Threads)

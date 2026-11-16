@@ -2,6 +2,7 @@
 #include <event-driven/core.h>
 #include <event-driven/algs.h>
 #include <event-driven/vis/filters.h>
+#include <event_flicker/filter.hpp>
 #include <yarp/os/Network.h>
 #include <yarp/os/RpcClient.h>
 #include <yarp/os/Bottle.h>
@@ -36,7 +37,9 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <memory>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -67,6 +70,9 @@ struct Camera {
     std::atomic<bool> running{false};
     std::atomic<int> kernel{7}, decayMilli{300}, mode{0}, windowMs{30};
     std::atomic<bool> denoise{false};
+    std::atomic<bool> removeFlicker{false};
+    std::atomic<int> flickerHz{50};
+    std::atomic<int> flickerBins{100};
     std::mutex mutex;
     std::deque<DisplayPacket> history;
     std::size_t historyCount{0};
@@ -78,6 +84,139 @@ struct Camera {
     bool currentDenoise{false};
     double lastEventTime{0}, eventRate{0}, acceptedPercent{100};
     Clock::time_point lastPacket{};
+    QString flickerStatus{"off"}; // protected by mutex, like image history
+
+    // Filter and sensor clock are worker-owned, never touched by the UI thread.
+    std::unique_ptr<event_flicker::Filter> flicker;
+    std::unique_ptr<event_flicker::TickClock> flickerClock;
+    bool currentFlicker{false};
+    int currentFlickerHz{50};
+    int currentFlickerBins{100};
+    bool flickerFault{false};
+    Clock::time_point lastFlickerPacket{};
+    Clock::time_point lastClockAdvance{};
+    double lastSourceEnvelope{0};
+    std::int64_t lastFlickerTime{0};
+
+    void configureFlicker() {
+        const bool enabled = removeFlicker.load();
+        const int hz = flickerHz.load();
+        const int bins = flickerBins.load();
+        if (enabled == currentFlicker && hz == currentFlickerHz && bins == currentFlickerBins) return;
+        currentFlicker = enabled;
+        currentFlickerHz = hz;
+        currentFlickerBins = bins;
+        flicker.reset();
+        flickerClock.reset();
+        flickerFault = false;
+        lastFlickerPacket = {};
+        lastClockAdvance = {};
+        lastFlickerTime = 0;
+        lastSourceEnvelope = 0;
+        QString status = "off";
+        if (enabled) {
+            try {
+                if (!ev::ts_status)
+                    throw std::runtime_error("sensor timestamps required");
+                event_flicker::Config config;
+                config.width = width;
+                config.height = height;
+                config.frequency_hz = hz;
+                config.bins_per_period = bins;
+                flicker = std::make_unique<event_flicker::Filter>(config);
+                flickerClock = std::make_unique<event_flicker::TickClock>(
+                    std::uint64_t(ev::max_stamp) + 1, ev::tsscaler * 1e9);
+                status = "warming up";
+            } catch (const std::exception& e) {
+                flickerFault = true;
+                status = QString("unavailable: ") + e.what();
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        history.clear();
+        historyCount = 0;
+        flickerStatus = status;
+    }
+
+    // Operates BEFORE any display decimation and OUTSIDE the image mutex.
+    // Callbacks feed only the event display; the portable library emits complete
+    // timestamped events suitable for application consumers as well.
+    void filterDisplay(ev::packet<ev::AE>& packet, DisplayPacket& display,
+                       Clock::time_point now, std::size_t stride) {
+        std::size_t emitted = 0;
+        event_flicker::Filter::Emit emit = [&](const event_flicker::Event& e) {
+            if (emitted++ % stride == 0 && display.events.size() < 250000)
+                display.events.push_back({static_cast<uint16_t>(e.x),
+                    static_cast<uint16_t>(e.y), e.polarity > 0});
+        };
+        if (!currentFlicker) {
+            for (const auto& e : packet) {
+                if (e.x >= width || e.y >= height) continue;
+                emit({0, e.x, e.y, e.p ? 1 : -1});
+            }
+            return;
+        }
+        if (flickerFault) return; // Never label raw fallback as filtered.
+        QString status;
+        const auto started = Clock::now();
+        try {
+            const double envelope = packet.envelope().getTime();
+            const double halfWrapSeconds = (std::uint64_t(ev::max_stamp) + 1) * ev::tsscaler / 2;
+            const double gapLimit = std::min(0.5, halfWrapSeconds);
+            const bool gap = lastFlickerPacket != Clock::time_point{} &&
+                std::chrono::duration<double>(now - lastFlickerPacket).count() >= gapLimit;
+            const bool sourceJump = lastSourceEnvelope > 0 && envelope > 0 &&
+                (envelope < lastSourceEnvelope || envelope - lastSourceEnvelope >= gapLimit);
+            if (gap || sourceJump) {
+                flicker->reset();
+                flickerClock->reset();
+                lastClockAdvance = {};
+                lastFlickerTime = 0;
+                std::lock_guard<std::mutex> lock(mutex);
+                history.clear(); historyCount = 0;
+            }
+            bool advancedClock = false;
+            std::int64_t firstTime = -1;
+            std::size_t checked = 0;
+            for (const auto& e : packet) {
+                if ((checked++ % 256) == 0 && (!running.load() || !removeFlicker.load() ||
+                    flickerHz.load() != currentFlickerHz || flickerBins.load() != currentFlickerBins)) {
+                    display.events.clear();
+                    return; // The next worker iteration applies the new setting.
+                }
+                const auto t = flickerClock->unwrap(e.ts);
+                if (firstTime < 0) firstTime = t;
+                advancedClock = advancedClock || t > lastFlickerTime;
+                lastFlickerTime = t;
+                if (e.x >= width || e.y >= height) continue;
+                flicker->push({t, e.x, e.y, e.p ? 1 : -1}, emit);
+            }
+            // The newest SENSOR timestamp is a watermark; host arrival time is
+            // not. A final partial bin waits for the next packet (or watermark).
+            if (firstTime >= 0) flicker->advance_to(lastFlickerTime, emit);
+            if (advancedClock || lastClockAdvance == Clock::time_point{}) lastClockAdvance = now;
+            if (now - lastClockAdvance >= std::chrono::milliseconds(100))
+                throw std::runtime_error("sensor timestamps are not advancing");
+            lastFlickerPacket = now;
+            lastSourceEnvelope = envelope;
+            const double ms = std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+            status = QString("%1, %2 Hz, %3 ms/packet, %4 out")
+                .arg(lastFlickerTime < 100000000 ? "warming up" : "on")
+                .arg(currentFlickerHz).arg(ms, 0, 'f', 2)
+                .arg(static_cast<qulonglong>(emitted));
+            const double sourceSpanMs = (lastFlickerTime - firstTime) / 1e6;
+            if (sourceSpanMs > 0 && ms > sourceSpanMs)
+                status += " (slower than this packet's sensor span)";
+        } catch (const std::exception& e) {
+            flickerFault = true;
+            display.events.clear();
+            status = QString("stopped: %1; toggle off/on to reset").arg(e.what());
+            std::lock_guard<std::mutex> lock(mutex);
+            history.clear(); historyCount = 0;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        flickerStatus = status;
+    }
 
     Camera() { reset(); }
 
@@ -100,6 +239,7 @@ struct Camera {
             auto lastRate = Clock::now();
             uint64_t seen = 0, kept = 0;
             while (running.load()) {
+                configureFlicker();
                 auto now = Clock::now();
                 // Connect only when the source becomes available. Do not repeatedly
                 // connect on transient shmem status checks.
@@ -123,6 +263,8 @@ struct Camera {
                     const std::size_t stride = std::max<std::size_t>(1, packet->size() / 2000);
                     display.events.reserve(packet->size() / stride + 1);
 
+                    filterDisplay(*packet, display, now, stride);
+
                     std::lock_guard<std::mutex> lock(mutex);
                     int k = kernel.load(), d = decayMilli.load(), m = mode.load();
                     bool noise = denoise.load();
@@ -134,13 +276,9 @@ struct Camera {
                         currentDenoise = noise;
                         reset();
                     }
-                    std::size_t i = 0;
                     for (const auto& e : *packet) {
                         const int x = e.x, y = e.y;
                         if (x < 0 || x >= width || y < 0 || y >= height) continue;
-                        if (i++ % stride == 0)
-                            display.events.push_back({static_cast<uint16_t>(x),
-                                static_cast<uint16_t>(y), bool(e.p)});
                         ++seen;
                         double t = packetTime;
                         if (ev::ts_status) {
@@ -187,7 +325,7 @@ struct Camera {
     }
 
     void snapshot(int rawMode, QImage& rawImage, QImage& representationImage,
-                  double& rate, double& accepted, bool& receiving) {
+                  double& rate, double& accepted, bool& receiving, QString& flickerInfo) {
         auto now = Clock::now();
         cv::Mat raw(height, width, CV_8UC3,
                     rawMode == 2 ? cv::Scalar(0, 0, 0) : cv::Scalar(255, 255, 255));
@@ -225,6 +363,7 @@ struct Camera {
                 tos.getSurface().convertTo(processed, CV_8U, 255.0);
             }
             rate = eventRate;
+            flickerInfo = flickerStatus;
             accepted = acceptedPercent;
             receiving = lastPacket != Clock::time_point{} &&
                         now - lastPacket < std::chrono::seconds(2);
@@ -274,6 +413,10 @@ class Window : public QMainWindow {
     QLabel *rawViews[2]{}, *processedViews[2]{};
     QComboBox *rawModes[2]{}, *representations[2]{};
     QCheckBox *noise[2]{}, *linkHardware{}, *linkEros{};
+    QCheckBox* removeFlicker{};
+    QSpinBox* flickerFrequency{};
+    QComboBox* flickerResolution{};
+    QLabel* flickerInfo{};
     QSlider *sensitivity[2]{}, *refractory[2]{}, *kernel[2]{}, *decay[2]{}, *accumulation{};
     QPushButton* apply{};
     yarp::os::RpcClient rpc;
@@ -289,7 +432,7 @@ public:
         auto* root = new QVBoxLayout(central);
         auto* grid = new QGridLayout;
         for (int s = 0; s < 2; ++s) {
-            grid->addWidget(panel(s ? "RIGHT RAW" : "LEFT RAW", rawViews[s]), 0, s);
+            grid->addWidget(panel(s ? "RIGHT EVENTS" : "LEFT EVENTS", rawViews[s]), 0, s);
             grid->addWidget(panel(s ? "RIGHT REPRESENTATION" : "LEFT REPRESENTATION",
                                   processedViews[s]), 1, s);
         }
@@ -318,6 +461,34 @@ public:
         linkEros = new QCheckBox("Link EROS parameters");
         linkEros->setChecked(true);
         processing->addRow(linkEros);
+        removeFlicker = new QCheckBox("Remove light flicker (both event views)");
+        removeFlicker->setToolTip("EFR comb filter on the top row. Bottom-row representations use their existing input.");
+        removeFlicker->setEnabled(ev::ts_status);
+        if (!ev::ts_status)
+            removeFlicker->setToolTip("Unavailable: event-driven was built without individual sensor timestamps.");
+        processing->addRow(removeFlicker);
+        flickerFrequency = new QSpinBox;
+        flickerFrequency->setRange(10, 1000);
+        flickerFrequency->setValue(50);
+        flickerFrequency->setSuffix(" Hz");
+        processing->addRow("Flicker base frequency", flickerFrequency);
+        flickerResolution = new QComboBox;
+        flickerResolution->addItems({"Fine: 0.2 ms at 50 Hz", "Medium: 1 ms at 50 Hz", "Coarse: 2 ms at 50 Hz"});
+        flickerResolution->setToolTip("Coarser bins reduce CPU/memory cost but lose temporal detail. Bin duration scales inversely with frequency.");
+        processing->addRow("Flicker time resolution", flickerResolution);
+        flickerInfo = new QLabel("Flicker removal off");
+        flickerInfo->setWordWrap(true);
+        processing->addRow(flickerInfo);
+        connect(removeFlicker, &QCheckBox::toggled, this, [this](bool enabled) {
+            for (auto& c : cameras) c.removeFlicker = enabled;
+        });
+        connect(flickerFrequency, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int hz) {
+            for (auto& c : cameras) c.flickerHz = hz;
+        });
+        connect(flickerResolution, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+            const int bins[] = {100, 20, 10};
+            for (auto& c : cameras) c.flickerBins = bins[index];
+        });
         for (int s = 0; s < 2; ++s) {
             auto* modes = new QWidget;
             auto* row = new QHBoxLayout(modes);
@@ -397,17 +568,21 @@ public:
         auto* timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this] {
             QString summary;
+            QString flickerSummary;
             for (int s = 0; s < 2; ++s) {
                 QImage raw, processed;
                 double rate, accepted;
                 bool receiving;
+                QString filterInfo;
                 cameras[s].snapshot(rawModes[s]->currentIndex(), raw, processed,
-                                    rate, accepted, receiving);
+                                    rate, accepted, receiving, filterInfo);
+                flickerSummary += QString("%1: %2%3").arg(s ? "Right" : "Left")
+                    .arg(filterInfo).arg(s ? "" : "\n");
                 rawViews[s]->setPixmap(QPixmap::fromImage(raw).scaled(rawViews[s]->size(),
                                      Qt::KeepAspectRatio, Qt::FastTransformation));
                 processedViews[s]->setPixmap(QPixmap::fromImage(processed).scaled(
                     processedViews[s]->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
-                summary += QString("%1: %2, %3 kEv/s, %4% accepted  ")
+                summary += QString("%1: %2, %3 kEv/s, representation kept %4%  ")
                     .arg(s ? "Right" : "Left").arg(receiving ? "live" : "no data")
                     .arg(rate / 1000.0, 0, 'f', 1).arg(accepted, 0, 'f', 1);
             }
@@ -418,6 +593,7 @@ public:
                 apply->setEnabled(true);
             }
             if (Clock::now() < rpcMessageUntil) summary += " | " + rpcMessage;
+            flickerInfo->setText(flickerSummary);
             statusBar()->showMessage(summary);
         });
         timer->start(33);
